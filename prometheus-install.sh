@@ -88,7 +88,7 @@ else
 fi
 
 # ── Logging — all messages include UTC timestamps ─────────────────────────────
-ts()   { date -u +%FT%HZ; }   # format: 2026-06-04T13:24Z (no seconds)
+ts()   { date -u +%FT%TZ; }   # ISO-8601 UTC: 2026-06-04T13:24:05Z
 log()  { printf '%s[INFO]%s  %s  %s\n' "$C_INFO"  "$C_RESET" "$(ts)" "$*"; }
 ok()   { printf '%s[ OK ]%s  %s  %s\n' "$C_OK"    "$C_RESET" "$(ts)" "$*"; }
 warn() { printf '%s[WARN]%s  %s  %s\n' "$C_WARN"  "$C_RESET" "$(ts)" "$*" >&2; }
@@ -416,11 +416,9 @@ setup_directories() {
     # user's cwd (which the service user may not have permission to access).
     # XDG_RUNTIME_DIR is intentionally NOT passed here — it is not needed for
     # unshare and causes "Error: setting up the process" in some environments.
-    sudo -u "${SVC_USER}" \
-      --chdir "${SVC_HOME}" \
-      HOME="${SVC_HOME}" \
-      podman unshare chown \
-        "${PROMETHEUS_CONTAINER_UID}:${PROMETHEUS_CONTAINER_GID}" "${DATA_DIR}" \
+    sudo -u "${SVC_USER}" env HOME="${SVC_HOME}" \
+      bash -c 'cd / && exec podman unshare chown "$1:$2" "$3"' \
+      _ "${PROMETHEUS_CONTAINER_UID}" "${PROMETHEUS_CONTAINER_GID}" "${DATA_DIR}" \
       || die "podman unshare chown failed.
               Verify subuid/subgid entries exist for '${SVC_USER}':
                 grep ${SVC_USER} /etc/subuid /etc/subgid"
