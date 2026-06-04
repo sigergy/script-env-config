@@ -245,10 +245,14 @@ SVC_UID=""
 run_as_svc() {
   [[ -n "${SVC_UID}" ]] \
     || die "BUG: run_as_svc called before SVC_UID was set."
+  # cd to / before exec so podman's re-exec inside the user namespace does not
+  # inherit the caller's cwd (e.g. /home/admin-rcev with mode 0700) and fail
+  # with "cannot chdir ... Permission denied / Error: setting up the process".
   sudo -u "${SVC_USER}" \
+    HOME="${SVC_HOME}" \
     XDG_RUNTIME_DIR="/run/user/${SVC_UID}" \
     DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${SVC_UID}/bus" \
-    "$@"
+    bash -c 'cd / && exec "$@"' _ "$@"
 }
 
 # =============================================================================
