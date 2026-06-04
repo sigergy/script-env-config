@@ -88,7 +88,7 @@ else
 fi
 
 # ── Logging — all messages include UTC timestamps ─────────────────────────────
-ts()   { date -u +%FT%TZ; }
+ts()   { date -u +%FT%HZ; }   # format: 2026-06-04T13:24Z (no seconds)
 log()  { printf '%s[INFO]%s  %s  %s\n' "$C_INFO"  "$C_RESET" "$(ts)" "$*"; }
 ok()   { printf '%s[ OK ]%s  %s  %s\n' "$C_OK"    "$C_RESET" "$(ts)" "$*"; }
 warn() { printf '%s[WARN]%s  %s  %s\n' "$C_WARN"  "$C_RESET" "$(ts)" "$*" >&2; }
@@ -411,10 +411,19 @@ setup_directories() {
 
   if [[ "${ENGINE}" == "podman" ]]; then
     log "Setting data directory ownership via podman unshare (rootless UID mapping)..."
-    run_as_svc podman unshare chown \
-      "${PROMETHEUS_CONTAINER_UID}:${PROMETHEUS_CONTAINER_GID}" \
-      "${DATA_DIR}" \
-      || die "podman unshare chown failed — check subuid/subgid for '${SVC_USER}'."
+    # podman unshare needs HOME pointing to the service user's home so it can
+    # find its config. We also set --chdir to avoid inheriting the calling
+    # user's cwd (which the service user may not have permission to access).
+    # XDG_RUNTIME_DIR is intentionally NOT passed here — it is not needed for
+    # unshare and causes "Error: setting up the process" in some environments.
+    sudo -u "${SVC_USER}" \
+      --chdir "${SVC_HOME}" \
+      HOME="${SVC_HOME}" \
+      podman unshare chown \
+        "${PROMETHEUS_CONTAINER_UID}:${PROMETHEUS_CONTAINER_GID}" "${DATA_DIR}" \
+      || die "podman unshare chown failed.
+              Verify subuid/subgid entries exist for '${SVC_USER}':
+                grep ${SVC_USER} /etc/subuid /etc/subgid"
   else
     # Docker is rootful — UID 65534 on the host IS nobody
     chown "${PROMETHEUS_CONTAINER_UID}:${PROMETHEUS_CONTAINER_GID}" "${DATA_DIR}" \
