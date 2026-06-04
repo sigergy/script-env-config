@@ -41,8 +41,17 @@ IFS=$'\n\t'
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 readonly SCRIPT_VERSION="1.3.0"
-readonly SCRIPT_NAME="$(basename "$0")"
 readonly LOG_TAG="podman-install"
+
+# When the script is piped through bash (curl ... | sudo bash), $0 is "bash".
+# Fall back to the canonical filename so instructions in the output make sense.
+_raw_name="$(basename "$0")"
+if [[ "${_raw_name}" == "bash" || "${_raw_name}" == "sh" ]]; then
+  readonly SCRIPT_NAME="podman-install.sh"
+else
+  readonly SCRIPT_NAME="${_raw_name}"
+fi
+unset _raw_name
 readonly PODMAN_MIN_MAJOR=5    # minimum major version considered "latest stable"
 SOCKET_ENABLED=false           # updated during enable_user_socket()
 
@@ -602,7 +611,9 @@ ${C_OK}========================================================${C_RESET}
     3) docker run --rm hello-world   (same result via Podman)
 
   To undo this installation:
-    sudo bash ${SCRIPT_NAME} --revert
+    curl -fsSL https://raw.githubusercontent.com/USER/REPO/COMMIT/${SCRIPT_NAME} \\
+         -o /tmp/${SCRIPT_NAME}
+    sudo bash /tmp/${SCRIPT_NAME} --revert
 
   Security note:
     Podman runs WITHOUT elevated privileges. Do not use root mode
