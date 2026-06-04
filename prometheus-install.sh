@@ -360,14 +360,48 @@ create_service_user() {
 }
 
 # =============================================================================
+# ENABLE LINGERING (Podman only — must run before any podman unshare call)
+# =============================================================================
+# loginctl enable-linger creates /run/user/<uid> and keeps the user's systemd
+# session alive without an interactive login. This directory must exist before
+# 'podman unshare' is called, because podman unshare itself needs the runtime
+# dir to initialise the user namespace.
+#
+# Called immediately after create_service_user, BEFORE setup_directories.
+enable_linger() {
+  [[ "${ENGINE}" == "podman" ]] || return 0   # Docker does not need this
+
+  log "Enabling systemd lingering for '${SVC_USER}' (required before podman unshare)..."
+  loginctl enable-linger "${SVC_USER}"     || die "Failed to enable lingering for '${SVC_USER}'."
+  ok "Lingering enabled."
+
+  # Wait up to 15 s for /run/user/<uid> to be created by logind.
+  # Without this directory podman unshare fails immediately with
+  # "lstat /run/user/<uid>: no such file or directory".
+  log "Waiting for /run/user/${SVC_UID} to be created by logind..."
+  local retries=15
+  while (( retries-- > 0 )); do
+    [[ -d "/run/user/${SVC_UID}" ]] && break
+    sleep 1
+  done
+
+  [[ -d "/run/user/${SVC_UID}" ]]     || die "/run/user/${SVC_UID} was not created within 15 s.
+            This can happen when logind is not fully running (e.g. containers).
+            Try: loginctl enable-linger ${SVC_USER} && sleep 5 && re-run."
+
+  ok "/run/user/${SVC_UID} is ready."
+}
+
+# =============================================================================
 # DIRECTORY SETUP
 # =============================================================================
 # The Prometheus container runs internally as nobody (UID 65534).
 # Under rootless Podman, UID 65534 inside the container maps to a host UID
 # within the service user's subuid range.
 #
-# 'podman unshare chown' runs the chown inside the user namespace, where
-# the UID mapping is already active — no manual subuid arithmetic needed.
+# 'podman unshare chown' runs the chown inside the user namespace where the
+# UID mapping is active — no manual subuid arithmetic needed.
+# enable_linger() MUST have run before this function (ensures /run/user/<uid>).
 setup_directories() {
   log "Creating config and data directories..."
 
@@ -677,21 +711,8 @@ UNIT_EOF
 # =============================================================================
 enable_and_start() {
   if [[ "${ENGINE}" == "podman" ]]; then
-    log "Enabling systemd lingering for '${SVC_USER}'..."
-    loginctl enable-linger "${SVC_USER}" \
-      || die "Failed to enable lingering for '${SVC_USER}'."
-    ok "Lingering enabled."
-
-    # Wait up to 10 s for /run/user/<uid> to be created by logind
-    local retries=10
-    while (( retries-- > 0 )); do
-      [[ -d "/run/user/${SVC_UID}" ]] && break
-      sleep 1
-    done
-    [[ -d "/run/user/${SVC_UID}" ]] \
-      || die "/run/user/${SVC_UID} was not created within 10 s.
-              Try: loginctl enable-linger ${SVC_USER} && sleep 3 && re-run."
-
+    # Lingering was already enabled by enable_linger() which runs before
+    # setup_directories(). /run/user/<uid> is guaranteed to exist at this point.
     log "Reloading systemd user daemon (triggers Quadlet generator)..."
     run_as_svc systemctl --user daemon-reload \
       || die "systemctl --user daemon-reload failed."
@@ -705,6 +726,7 @@ enable_and_start() {
       warn "Start manually as '${SVC_USER}':"
       warn "  systemctl --user enable --now prometheus.service"
     fi
+
 
   else
     log "Reloading systemd daemon..."
@@ -824,6 +846,7 @@ main() {
   [[ "${ENGINE}" == "podman" ]] && ENGINE_JOURNAL_FLAG="--user"
 
   create_service_user    # creates user + subuid/subgid
+  enable_linger          # enable-linger + wait for /run/user/<uid> (Podman only)
   setup_directories      # creates dirs + correct UID ownership via podman unshare
   write_default_config   # writes config atomically via temp file
 
