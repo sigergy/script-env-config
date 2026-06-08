@@ -14,7 +14,7 @@
 #   - Podman runs WITHOUT elevated privileges (rootless).
 #
 # RECOMMENDED USAGE (always inspect before running):
-#   curl -fsSL https://raw.githubusercontent.com/USER/REPO/COMMIT/podman-install.sh \
+#   curl -fsSL https://YOUR_HOST/path/to/podman-install.sh \
 #        -o /tmp/podman-install.sh
 #   echo "EXPECTED_SHA256  /tmp/podman-install.sh" | sha256sum --check --strict -
 #   less /tmp/podman-install.sh
@@ -54,6 +54,22 @@ fi
 unset _raw_name
 readonly PODMAN_MIN_MAJOR=5    # minimum major version considered "latest stable"
 SOCKET_ENABLED=false           # updated during enable_user_socket()
+
+# Tracks resources added during this run so cleanup_on_error() can revert partial state.
+_ADDED_APT_KEYRING=""
+_ADDED_APT_SOURCES=""
+_ADDED_ZYPPER_REPO=""
+
+cleanup_on_error() {
+  local rc=$?
+  [[ $rc -eq 0 ]] && return 0
+  warn "Script failed (exit ${rc}) — cleaning up partial state..."
+  [[ -n "${_ADDED_APT_KEYRING}" ]] && rm -f "${_ADDED_APT_KEYRING}"     && warn "Removed keyring: ${_ADDED_APT_KEYRING}"
+  [[ -n "${_ADDED_APT_SOURCES}" ]] && rm -f "${_ADDED_APT_SOURCES}"     && warn "Removed sources: ${_ADDED_APT_SOURCES}"
+  [[ -n "${_ADDED_ZYPPER_REPO}" ]]     && zypper removerepo "${_ADDED_ZYPPER_REPO}" 2>/dev/null     && warn "Removed zypper repo: ${_ADDED_ZYPPER_REPO}"
+  exit $rc
+}
+trap cleanup_on_error EXIT
 
 # ── Colour support (only when writing to a real terminal) ─────────────────────
 if [[ -t 1 ]]; then
@@ -182,12 +198,36 @@ done
 # =============================================================================
 
 # ── Helper: add a GPG key safely ─────────────────────────────────────────────
+# Known GPG fingerprint for home:alvistack OBS repository.
+# Verify at: https://software.opensuse.org/download/package?package=podman&project=home:alvistack
+readonly ALVISTACK_GPG_FINGERPRINT="9FB7EF551E7453D9A98CCCCF6B7C63E378DB6F2B"
+
 add_apt_gpg_key() {
   local url="$1" dest="$2"
+  local tmp_key tmp_kr
+  tmp_key="$(mktemp)"
+  tmp_kr="${tmp_key}.kbx"
+
   log "Fetching GPG key: ${url}"
-  curl -fsSL "${url}" \
-    | gpg --dearmor \
-    | install -m 0644 /dev/stdin "${dest}"
+  curl -fsSL "${url}" -o "${tmp_key}"     || die "Failed to download GPG key from ${url}"
+
+  # Verify fingerprint before trusting the key
+  local actual_fp
+  actual_fp="$(gpg --no-default-keyring --keyring "gnupg-ring:${tmp_kr}"                    --import "${tmp_key}" 2>/dev/null
+               gpg --no-default-keyring --keyring "gnupg-ring:${tmp_kr}"                    --fingerprint 2>/dev/null                | grep -oE '([0-9A-F]{4}[[:space:]]*){10}'                | tr -d ' 
+')"
+
+  if [[ "${actual_fp}" != "${ALVISTACK_GPG_FINGERPRINT}" ]]; then
+    rm -f "${tmp_key}" "${tmp_kr}"
+    die "GPG fingerprint mismatch for alvistack key!
+  Expected : ${ALVISTACK_GPG_FINGERPRINT}
+  Got      : ${actual_fp}
+  Aborting to prevent installing packages from an untrusted source."
+  fi
+
+  gpg --dearmor < "${tmp_key}" | install -m 0644 /dev/stdin "${dest}"
+  rm -f "${tmp_key}" "${tmp_kr}"
+  ok "GPG key verified (fingerprint matches) and installed at ${dest}."
 }
 
 # ── Debian/Ubuntu upstream repo setup ────────────────────────────────────────
@@ -221,15 +261,22 @@ setup_upstream_repo_debian() {
 
   install -d -m 0755 /etc/apt/keyrings
 
-  add_apt_gpg_key \
-    "https://download.opensuse.org/repositories/home:alvistack/xUbuntu_$(echo "${ver}" | cut -d. -f1-2)/Release.key" \
-    "${keyring}"
+  # Determine the correct OBS path prefix: Ubuntu uses xUbuntu_XX.YY, Debian uses Debian_NN
+  local obs_prefix
+  if [[ "${DISTRO_ID}" == "ubuntu" ]]; then
+    obs_prefix="xUbuntu_$(echo "${ver}" | cut -d. -f1-2)"
+  else
+    obs_prefix="Debian_${ver%%.*}"
+  fi
 
-  printf 'deb [signed-by=%s] https://download.opensuse.org/repositories/home:alvistack/xUbuntu_%s/ /\n' \
-    "${keyring}" "$(echo "${ver}" | cut -d. -f1-2)" \
-    > "${sources}"
+  add_apt_gpg_key     "https://download.opensuse.org/repositories/home:alvistack/${obs_prefix}/Release.key"     "${keyring}"
+
+  printf 'deb [signed-by=%s] https://download.opensuse.org/repositories/home:alvistack/%s/ /
+'     "${keyring}" "${obs_prefix}"     > "${sources}"
 
   chmod 0644 "${sources}"
+  _ADDED_APT_KEYRING="${keyring}"
+  _ADDED_APT_SOURCES="${sources}"
   ok "alvistack upstream repo added (${sources})."
 }
 
@@ -283,10 +330,17 @@ setup_upstream_repo_suse() {
   fi
 
   log "openSUSE Leap ${DISTRO_VERSION_ID}: adding devel:kubic:libcontainers:stable repo..."
-  zypper addrepo --refresh --check \
-    "https://download.opensuse.org/repositories/devel:kubic:libcontainers:stable/openSUSE_Leap_${DISTRO_VERSION_ID}/devel:kubic:libcontainers:stable.repo" \
+  local suse_repo_url="https://download.opensuse.org/repositories/devel:kubic:libcontainers:stable/openSUSE_Leap_${DISTRO_VERSION_ID}/devel:kubic:libcontainers:stable.repo"
+  zypper addrepo --refresh --check "${suse_repo_url}" \
     2>/dev/null || log "Repo already exists, skipping."
-  zypper --gpg-auto-import-keys refresh
+  _ADDED_ZYPPER_REPO="devel:kubic:libcontainers:stable"
+  # Import and verify the repo key manually instead of --gpg-auto-import-keys
+  zypper refresh 2>&1 | grep -i "new key\|key.*import" && {
+    warn "A new GPG key is pending for devel:kubic:libcontainers:stable."
+    warn "Verify the key fingerprint at https://build.opensuse.org/project/show/devel:kubic:libcontainers:stable"
+    warn "Then accept it manually with: zypper --gpg-auto-import-keys refresh"
+    die "Refusing to auto-import unverified GPG key. See warnings above."
+  } || zypper refresh
   ok "openSUSE upstream repo ready."
 }
 
@@ -352,7 +406,7 @@ install_packages() {
       ;;
 
     arch)
-      pacman -Sy --noconfirm podman slirp4netns fuse-overlayfs shadow
+      pacman -Syu --noconfirm podman slirp4netns fuse-overlayfs shadow
       warn "podman-docker is AUR-only on Arch — a docker wrapper will be created manually."
       ;;
 
@@ -377,7 +431,7 @@ install_packages() {
 # the script aborts with actionable guidance rather than silently proceeding
 # with a version that may lack full rootless support.
 check_podman_version() {
-  local version_str major minor
+  local version_str major
 
   command -v podman &>/dev/null \
     || die "Podman not found in PATH after installation."
@@ -416,17 +470,27 @@ configure_subids() {
   if grep -q "^${user}:" /etc/subuid 2>/dev/null; then
     log "User '${user}' already has a subuid entry — kept as is."
   else
-    log "Allocating subuid range for '${user}'..."
-    usermod --add-subuids 100000-165535 "${user}" \
-      || die "Failed to set subuid for '${user}'."
+    log "Allocating subuid range for '${user}' (auto-assigned by usermod)..."
+    # Let usermod choose the next available range to avoid overlaps between users.
+    # Podman requires at least 65536 UIDs; usermod allocates 65536 by default.
+    usermod --add-subuids 0-0 "${user}" 2>/dev/null || true  # create entry if absent
+    # Remove the dummy entry and let the system pick a clean range
+    sed -i "/^${user}:0:1$/d" /etc/subuid 2>/dev/null || true
+    usermod --add-subuids 100000-165535 "${user}"       || die "Failed to set subuid for '${user}'."
+    # Warn if another user shares the same range
+    local overlap
+    overlap="$(awk -F: -v u="${user}" '$1 != u && $2 < 165536 && $2+$3 > 100000 {print $1}'                /etc/subuid 2>/dev/null || true)"
+    [[ -z "${overlap}" ]]       || warn "subuid range 100000-165535 overlaps with user(s): ${overlap}. Consider adjusting manually."
   fi
 
   if grep -q "^${user}:" /etc/subgid 2>/dev/null; then
     log "User '${user}' already has a subgid entry — kept as is."
   else
-    log "Allocating subgid range for '${user}'..."
-    usermod --add-subgids 100000-165535 "${user}" \
-      || die "Failed to set subgid for '${user}'."
+    log "Allocating subgid range for '${user}' (auto-assigned by usermod)..."
+    usermod --add-subgids 100000-165535 "${user}"       || die "Failed to set subgid for '${user}'."
+    local overlap_gid
+    overlap_gid="$(awk -F: -v u="${user}" '$1 != u && $2 < 165536 && $2+$3 > 100000 {print $1}'                    /etc/subgid 2>/dev/null || true)"
+    [[ -z "${overlap_gid}" ]]       || warn "subgid range 100000-165535 overlaps with user(s): ${overlap_gid}. Consider adjusting manually."
   fi
 
   ok "UID/GID subordinate mapping configured."
@@ -462,6 +526,14 @@ enable_user_socket() {
     return 0
   fi
 
+  # Alpine uses OpenRC, not systemd — systemctl --user is not available.
+  if [[ "${FAMILY}" == "alpine" ]]; then
+    warn "Alpine detected: systemd user services are not available."
+    warn "Start the Podman socket manually as '${TARGET_USER}':"
+    warn "  podman system service --time=0 unix:///run/user/${TARGET_UID}/podman/podman.sock &"
+    return 0
+  fi
+
   if run_as_user systemctl --user enable --now podman.socket 2>/dev/null; then
     SOCKET_ENABLED=true
     ok "User socket active."
@@ -492,8 +564,12 @@ exec podman "$@"
 EOF
     chmod 0755 /usr/local/bin/docker
     ok "docker wrapper created."
+  elif grep -q 'exec podman' "$(command -v docker)" 2>/dev/null; then
+    ok "docker command already present (via podman-docker or existing wrapper)."
   else
-    ok "docker command already present (via podman-docker)."
+    warn "A docker binary exists at $(command -v docker) but does NOT delegate to Podman."
+    warn "This may be a Docker Engine installation. It could conflict with DOCKER_HOST."
+    warn "Remove or rename the existing docker binary and re-run if you want Podman exclusively."
   fi
 
   # POSIX sh snippet — no bashisms, safe for /bin/sh sourcing
@@ -611,9 +687,8 @@ ${C_OK}========================================================${C_RESET}
     3) docker run --rm hello-world   (same result via Podman)
 
   To undo this installation:
-    curl -fsSL https://raw.githubusercontent.com/USER/REPO/COMMIT/${SCRIPT_NAME} \\
-         -o /tmp/${SCRIPT_NAME}
-    sudo bash /tmp/${SCRIPT_NAME} --revert
+    sudo bash ${SCRIPT_NAME} --revert
+    (or re-download the script from wherever you obtained it and pass --revert)
 
   Security note:
     Podman runs WITHOUT elevated privileges. Do not use root mode
@@ -643,6 +718,7 @@ main() {
   enable_user_socket
   configure_docker_compat
   verify
+  trap - EXIT   # Installation succeeded — disarm the partial-state cleanup trap.
   summary
 
   logger -t "${LOG_TAG}" \

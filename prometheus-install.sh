@@ -228,9 +228,9 @@ vol_flags() {
 log "SELinux active: ${SELINUX_ACTIVE}"
 
 # ── Derived paths ─────────────────────────────────────────────────────────────
-SVC_HOME="/home/${SVC_USER}"
-CONFIG_DIR="${SVC_HOME}/prometheus/config"
-DATA_DIR="${SVC_HOME}/prometheus/data"
+SVC_HOME="/opt/${SVC_USER}"
+CONFIG_DIR="${SVC_HOME}/config"
+DATA_DIR="${SVC_HOME}/data"
 CONFIG_FILE="${CONFIG_DIR}/prometheus.yml"
 
 QUADLET_DIR="${SVC_HOME}/.config/containers/systemd"
@@ -302,7 +302,7 @@ revert() {
   ok "Lingering disabled."
 
   # ── Remove config and data directories ──────────────────────────────────────
-  rm -rf "${SVC_HOME}/prometheus" 2>/dev/null || true
+  rm -rf "${CONFIG_DIR}" "${DATA_DIR}" 2>/dev/null || true
   ok "Config and data directories removed."
 
   # ── Service user ────────────────────────────────────────────────────────────
